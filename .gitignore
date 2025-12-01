@@ -1,0 +1,57 @@
+# Dataset files (too large for GitHub)
+dataset/
+*.csv
+
+# Model files (too large)
+*.pt
+*.pth
+*.pkl
+*.h5
+*.keras
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Deployment artifacts (keep code, exclude models)
+deployment/*.pt
+deployment/*.pkl
+deployment/model_summary.json
+
+# Keep these deployment files:
+!deployment/inference.py
+!deployment/udp_receiver.py
+!deployment/requirements.txt
+!deployment/deployment_config.json
+!deployment/README.md
+
+# Memory/state files
+memory.yaml
+*.yaml
+!requirements.yaml  # if you have one
+
+# Logs
+*.log
+logs/
