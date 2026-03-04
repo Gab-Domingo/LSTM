@@ -1,0 +1,17 @@
+# Deployment requirements for Raspberry Pi
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.21.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+
+# PyTorch - CPU version for Raspberry Pi
+# For ARM architecture (Raspberry Pi), install from PyTorch website:
+# https://pytorch.org/get-started/locally/
+# Example: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=1.10.0
+
+# Optional: for better performance
+# numba>=0.56.0  # JIT compilation for faster processing
+
