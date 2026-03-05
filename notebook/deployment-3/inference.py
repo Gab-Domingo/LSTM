@@ -96,12 +96,10 @@ class WheelchairMotorController:
         self.debug_mode = debug_mode
         self.verbose = verbose
         
-        # Continuous control state
+        # Simplified continuous control state (no duration limits)
         self.is_moving = False
         self.current_movement = None  # 'LEFT', 'RIGHT', 'FORWARD', or None
         self.movement_start_time = None
-        self.movement_end_time = None
-        self.normalization_until = 0.0  # Always 0.0 (normalization disabled)
         
         # Motor state
         self.left_motor_speed = 0
@@ -150,9 +148,8 @@ class WheelchairMotorController:
                 print(f"   Left Motor: RPWM={self.LEFT_MOTOR_RPWM}, LPWM={self.LEFT_MOTOR_LPWM}, R_EN={self.LEFT_MOTOR_R_EN}, L_EN={self.LEFT_MOTOR_L_EN}")
                 print(f"   Right Motor: RPWM={self.RIGHT_MOTOR_RPWM}, LPWM={self.RIGHT_MOTOR_LPWM}, R_EN={self.RIGHT_MOTOR_R_EN}, L_EN={self.RIGHT_MOTOR_L_EN}")
                 print(f"   PWM Frequency: {self.PWM_FREQUENCY} Hz")
-                print(f"   Control Mode: CONTINUOUS (model-driven)")
-                print(f"   Movement duration: {self.movement_duration}s")
-                print(f"   Normalization period: DISABLED (continuous predictions enabled)")
+                print(f"   Control Mode: SIMPLIFIED - Direct model trust")
+                print(f"   ✓ Commands execute immediately based on predictions")
             except Exception as e:
                 print(f"❌ GPIO initialization failed: {e}")
                 self.gpio_initialized = False
@@ -164,80 +161,46 @@ class WheelchairMotorController:
     
     def update_command(self, command: str):
         """
-        Continuous wheelchair control - model predictions directly control movement.
+        SIMPLIFIED wheelchair control - trust model predictions directly.
         
         Control Logic:
-        1. When movement command detected → Motor spins for movement_duration seconds
-        2. During movement → Continue accepting commands (for sustained contractions)
-        3. No normalization period - model predictions control movement continuously
-        
-        This allows the model to handle sustained contractions as it was trained.
+        1. Execute commands immediately based on current prediction
+        2. No movement duration limits - continuous control
+        3. Commands update in real-time as model predictions change
         
         Args:
             command: One of 'REST', 'LEFT', 'RIGHT', 'FORWARD'
         """
         current_time = time.time()
         
-        # Check if we're currently moving
-        if self.is_moving:
-            # Check if movement duration completed
-            if current_time >= self.movement_end_time:
-                # Movement complete - stop motors
+        # Execute command immediately
+        if command == 'REST':
+            # Stop motors immediately
+            if self.is_moving:
                 self._stop_movement(current_time)
-            
-            # Allow new commands even during movement (for sustained contractions)
-            # If command changes, update immediately
-            if command != 'REST' and command != self.current_movement:
-                # New command during movement - update immediately
-                self._start_movement(command, current_time)
-            elif command == 'REST':
-                # REST command - stop movement immediately
-                self._stop_movement(current_time)
-            # Otherwise, continue current movement
-            return
-        
-        # Not moving - ready to accept commands
-        if command != 'REST':
-            # New movement command - start it
-            self._start_movement(command, current_time)
-    
-    def _start_movement(self, command: str, current_time: float):
-        """
-        Start a new movement (continuous control).
-        
-        Args:
-            command: Movement command ('LEFT', 'RIGHT', 'FORWARD')
-            current_time: Current timestamp
-        """
-        self.is_moving = True
-        self.current_movement = command
-        self.movement_start_time = current_time
-        self.movement_end_time = current_time + self.movement_duration
-        
-        # Execute the command
-        self._execute_command(command)
-        
-        # Movement started - display will update automatically
+        else:
+            # Execute movement command (LEFT, RIGHT, FORWARD)
+            if command != self.current_movement:
+                # New command or command change - execute immediately
+                self._execute_command(command)
+                self.is_moving = True
+                self.current_movement = command
+                self.movement_start_time = current_time
     
     def _stop_movement(self, current_time: float):
         """
         Stop current movement immediately.
-        No normalization period - ready for next command immediately.
         
         Args:
             current_time: Current timestamp
         """
-        # Movement stopped - display will update automatically
-        
         # Stop motors
         self._execute_command('REST')
         
-        # Reset movement state (no normalization period)
+        # Reset movement state
         self.is_moving = False
         self.current_movement = None
         self.movement_start_time = None
-        self.movement_end_time = None
-        self.normalization_until = 0.0  # No normalization
     
     def _execute_command(self, command: str):
         """
@@ -323,12 +286,10 @@ class WheelchairMotorController:
             self._set_motor_speed('left', 0, 'forward')
             self._set_motor_speed('right', 0, 'forward')
         
-        # Reset continuous control state
+        # Reset simplified control state
         self.is_moving = False
         self.current_movement = None
         self.movement_start_time = None
-        self.movement_end_time = None
-        self.normalization_until = 0.0
     
     def test_motors(self):
         """Test motor functionality - runs each motor briefly for verification."""
@@ -436,11 +397,7 @@ class DevicePipeline:
             'high_bandpower': deque(maxlen=5),  # Last 5 high bandpowers
         }
         
-        # SIMPLIFIED: Only use consecutive REST counter for reliable STOP detection
-        # This prevents flickering STOP commands without overriding model predictions
-        self.consecutive_rest_predictions = 0
-        self.min_rest_for_stop = 3  # Require 3 consecutive REST predictions before confirming STOP
-        self.confirmed_rest_state = 'REST'  # Confirmed REST state (for wheelchair control)
+        # REMOVED: REST confirmation logic - we now trust the model's predictions directly
         
         # Statistics
         self.total_windows_processed = 0
@@ -689,10 +646,6 @@ class InferenceEngine:
         self.last_wheelchair_command = 'REST'
         self.wheelchair_command_history = deque(maxlen=50)
         
-        # Track predictions for continuous control (transition detection)
-        self.prev_left_pred = 'REST'
-        self.prev_right_pred = 'REST'
-        
         # Display state (unified single-line display)
         self.display_lines_printed = 0
         self.last_display_update = 0
@@ -709,16 +662,16 @@ class InferenceEngine:
         if self.enable_wheelchair:
             if GPIO_AVAILABLE or wheelchair_debug:
                 self.wheelchair_controller = WheelchairMotorController(
-                    movement_duration=2.0,      # 2.0s per movement
-                    normalization_period=0.0,   # DISABLED - continuous predictions
+                    movement_duration=0.0,          # Not used - immediate execution
+                    normalization_period=0.0,       # Not used - immediate execution
                     debug_mode=wheelchair_debug,
                     verbose=True
                 )
-                print(f"\n🦽 CONTINUOUS wheelchair control {'ENABLED' if not wheelchair_debug else 'ENABLED (DEBUG MODE - no motor movement)'}")
+                print(f"\n🦽 SIMPLIFIED wheelchair control {'ENABLED' if not wheelchair_debug else 'ENABLED (DEBUG MODE - no motor movement)'}")
                 print(f"   Motor power: 50% duty cycle")
-                print(f"   Movement duration: 2 seconds")
-                print(f"   Normalization period: DISABLED")
-                print(f"   ✓ Model predictions control movement continuously")
+                print(f"   Control mode: Direct model trust - immediate execution")
+                print(f"   ✓ No confirmation delays or duration limits")
+                print(f"   ✓ Commands execute immediately based on predictions")
             else:
                 print(f"\n⚠️  Wheelchair control requested but GPIO not available (check RPi.GPIO installation)")
                 self.enable_wheelchair = False
@@ -1004,16 +957,7 @@ class InferenceEngine:
         # Track prediction history for safety monitoring
         pipeline.prediction_history.append(final_prediction)
         
-        # Robust REST detection: require consecutive REST predictions for reliable STOP
-        if final_prediction == 'REST':
-            pipeline.consecutive_rest_predictions += 1
-            if pipeline.consecutive_rest_predictions >= pipeline.min_rest_for_stop:
-                # Confirmed REST - safe to STOP
-                pipeline.confirmed_rest_state = 'REST'
-        else:
-            # FIST detected - reset REST counter and confirm FIST
-            pipeline.consecutive_rest_predictions = 0
-            pipeline.confirmed_rest_state = 'FIST'
+        # REMOVED: REST confirmation logic - trust model predictions directly
         
         # Update last valid prediction timestamp (for HOLD state)
         if final_prediction in ['REST', 'FIST']:
@@ -1034,71 +978,56 @@ class InferenceEngine:
 
     def _update_wheelchair_command(self):
         """
-        Combine predictions from LEFT and RIGHT devices with CONTINUOUS control.
-        Uses CONFIRMED REST state (requires consecutive REST predictions) for reliable STOP.
+        Combine predictions from LEFT and RIGHT devices with DIRECT model trust.
+        Uses raw model predictions with confidence thresholds for quality control.
         
-        Control Logic:
-        1. Model predictions directly control movement
-        2. No normalization period - sustained contractions work as trained
-        3. Movement duration: 2 seconds per command
-        4. Commands can update during movement (for sustained contractions)
-        5. REST requires 3 consecutive predictions for reliable STOP (safety)
+        SIMPLIFIED Control Logic:
+        1. Trust model predictions directly - no confirmation delays
+        2. Apply confidence thresholds to filter low-quality predictions
+        3. Commands execute immediately based on current predictions
+        4. No movement duration limits - continuous control based on sustained contractions
         
         Motor Control:
         - Device 1 (LEFT) FIST → RIGHT motor spins → LEFT turn
         - Device 2 (RIGHT) FIST → LEFT motor spins → RIGHT turn  
         - BOTH devices FIST → BOTH motors spin → FORWARD
-        - CONFIRMED REST → Stop motors (requires consecutive REST predictions)
+        - REST (either device) → Stop motors immediately
         """
         current_time = time.time()
         
-        # Use CONFIRMED REST state (more reliable for STOP commands)
-        left_pred = self.left_pipeline.confirmed_rest_state
-        right_pred = self.right_pipeline.confirmed_rest_state
+        # Get raw predictions directly from model
+        left_pred = self.left_pipeline.last_prediction
+        right_pred = self.right_pipeline.last_prediction
         left_conf = self.left_pipeline.last_confidence
         right_conf = self.right_pipeline.last_confidence
         
-        # Also track raw predictions for transition detection
-        left_raw_pred = self.left_pipeline.last_prediction
-        right_raw_pred = self.right_pipeline.last_prediction
+        # Confidence thresholds for quality control
+        min_confidence = 0.55  # Minimum confidence for any movement command
         
-        # Detect transitions (REST → FIST) using raw predictions for faster GO response
-        # Use confirmed REST for STOP (reliable), but raw FIST for GO (fast response)
-        left_transition = (self.prev_left_pred == 'REST' and left_raw_pred == 'FIST')
-        right_transition = (self.prev_right_pred == 'REST' and right_raw_pred == 'FIST')
+        # Apply confidence filtering - treat low confidence as REST for safety
+        if left_conf < min_confidence:
+            left_pred = 'REST'
+        if right_conf < min_confidence:
+            right_pred = 'REST'
         
-        # Update previous predictions for next cycle (use raw predictions for transition detection)
-        self.prev_left_pred = left_raw_pred
-        self.prev_right_pred = right_raw_pred
-        
-        # Determine wheelchair command based on transitions
+        # Determine wheelchair command based on current predictions
         wheelchair_cmd = 'REST'
         
-        # FORWARD detection - both devices transition to FIST with high confidence
-        # Use raw predictions for GO (fast), confirmed REST for STOP (reliable)
-        forward_threshold = 0.55
-        both_transition = (left_transition and right_transition)
-        both_fist = (left_raw_pred == 'FIST' and right_raw_pred == 'FIST')
-        both_decent_conf = (left_conf >= forward_threshold and right_conf >= forward_threshold)
-        
-        # REST detection: require BOTH devices to be in confirmed REST state for STOP
-        both_confirmed_rest = (left_pred == 'REST' and right_pred == 'REST')
-        
-        if both_confirmed_rest:
-            # BOTH devices in confirmed REST → STOP (reliable)
-            wheelchair_cmd = 'REST'
-        
-        elif both_transition and both_decent_conf:
-            # Both devices transitioned → FORWARD
+        # FORWARD: Both devices predict FIST with decent confidence
+        if left_pred == 'FIST' and right_pred == 'FIST':
             wheelchair_cmd = 'FORWARD'
         
-        elif left_transition and not both_transition:
-            # Only LEFT device transitioned → LEFT turn
+        # LEFT turn: Only LEFT device predicts FIST
+        elif left_pred == 'FIST' and right_pred == 'REST':
             wheelchair_cmd = 'LEFT'
         
-        elif right_transition and not both_transition:
-            # Only RIGHT device transitioned → RIGHT turn
+        # RIGHT turn: Only RIGHT device predicts FIST
+        elif left_pred == 'REST' and right_pred == 'FIST':
             wheelchair_cmd = 'RIGHT'
+        
+        # REST: Either both REST or confidence too low
+        else:
+            wheelchair_cmd = 'REST'
         
         # Update state
         self.last_wheelchair_command = wheelchair_cmd
@@ -1106,12 +1035,12 @@ class InferenceEngine:
             'command': wheelchair_cmd,
             'left_pred': left_pred,
             'right_pred': right_pred,
-            'left_conf': self.left_pipeline.last_confidence,
-            'right_conf': self.right_pipeline.last_confidence,
+            'left_conf': left_conf,
+            'right_conf': right_conf,
             'timestamp': current_time
         })
         
-        # Send command to motor controller (impulse-based)
+        # Send command to motor controller (immediate execution)
         if self.enable_wheelchair and self.wheelchair_controller is not None:
             self.wheelchair_controller.update_command(wheelchair_cmd)
         
