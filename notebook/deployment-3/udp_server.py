@@ -64,6 +64,9 @@ class UDPServer:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             # Enable broadcast reception
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            # CRITICAL: Reduce receive buffer to prevent stale data buildup
+            # Smaller buffer = faster response when device turns off
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)  # 32KB (reduced from default ~200KB)
             self.socket.bind((self.host, self.port))
             self.socket.settimeout(1.0)  # Timeout for periodic checks
             self.running = True
@@ -73,6 +76,7 @@ class UDPServer:
             print(f"📡 UDP Server started")
             print(f"   Listening on: {actual_host}:{actual_port}")
             print(f"   ESP32 should send to: {actual_host}:{actual_port}")
+            print(f"   Receive buffer: 32KB (optimized for low latency)")
             if self.debug:
                 print(f"   Debug mode: ENABLED")
             print(f"   ✅ Server is ready and waiting for UDP packets...\n")

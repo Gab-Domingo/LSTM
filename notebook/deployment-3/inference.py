@@ -24,6 +24,8 @@ from pathlib import Path
 from datetime import datetime
 from collections import deque
 from typing import Optional
+import queue
+import threading
 
 # Import deployment modules
 from model_loader import load_model
@@ -620,27 +622,33 @@ class InferenceEngine:
             2: self.right_pipeline
         }
         
+        # CRITICAL: Queue-based processing for responsive UDP reception
+        # Move heavy processing off receive thread to prevent blocking
+        self.batch_queue = queue.Queue(maxsize=10)  # Small queue to prevent old data buildup
+        self.processing_thread = None
+        self.processing_running = False
+        
         # Initialize UDP server (DUAL-PORT mode for separate ESP32 streams)
         # LEFT device on port 5000, RIGHT device on port 5001
         self.server_left = UDPServer(
             host='0.0.0.0',
             port=self.port,  # 5000
-            batch_callback=lambda device_id, emg, imu: self._on_batch_received(1, emg, imu),  # Force device_id=1
+            batch_callback=lambda device_id, emg, imu: self._enqueue_batch(1, emg, imu),  # Enqueue instead of direct processing
             debug=self.debug
         )
         self.server_right = UDPServer(
             host='0.0.0.0',
             port=self.port + 1,  # 5001
-            batch_callback=lambda device_id, emg, imu: self._on_batch_received(2, emg, imu),  # Force device_id=2
+            batch_callback=lambda device_id, emg, imu: self._enqueue_batch(2, emg, imu),  # Enqueue instead of direct processing
             debug=self.debug
         )
         
         # Global statistics
         self.start_time = None
-        # OPTIMIZED: Reduced inference interval for faster wheelchair response
-        # 50ms provides rapid updates while preventing excessive computation
+        # CRITICAL: Optimized inference interval for maximum responsiveness
+        # 30ms provides rapid updates while preventing excessive computation
         # Lower latency = faster STOP/GO response for safety
-        self.inference_interval = 0.050  # 50ms between inferences (faster response for safety)
+        self.inference_interval = 0.030  # 30ms between inferences (33 Hz, reduced from 50ms for faster response)
         
         # Wheelchair control state
         self.last_wheelchair_command = 'REST'
@@ -676,10 +684,55 @@ class InferenceEngine:
                 print(f"\n⚠️  Wheelchair control requested but GPIO not available (check RPi.GPIO installation)")
                 self.enable_wheelchair = False
     
+    def _enqueue_batch(self, device_id: int, emg_samples: np.ndarray, imu_samples: np.ndarray):
+        """
+        CRITICAL: Enqueue batch for processing (non-blocking for UDP receive thread).
+        This keeps UDP reception fast and responsive.
+        
+        Args:
+            device_id: Device ID (1=LEFT, 2=RIGHT)
+            emg_samples: EMG samples array
+            imu_samples: IMU samples array (n_samples, 6)
+        """
+        try:
+            # Try to add to queue (non-blocking with timeout)
+            self.batch_queue.put((device_id, emg_samples, imu_samples), block=False)
+        except queue.Full:
+            # Queue full - drop oldest and add newest (prevent stale data buildup)
+            if self.debug:
+                print(f"⚠️  Batch queue full, dropping old data")
+            try:
+                self.batch_queue.get_nowait()  # Remove oldest
+                self.batch_queue.put((device_id, emg_samples, imu_samples), block=False)
+            except:
+                pass  # If still fails, just drop this batch
+    
+    def _processing_worker(self):
+        """
+        CRITICAL: Worker thread that processes batches from queue.
+        Runs independently from UDP receive thread for maximum responsiveness.
+        """
+        while self.processing_running:
+            try:
+                # Get batch from queue (blocking with timeout)
+                device_id, emg_samples, imu_samples = self.batch_queue.get(timeout=0.1)
+                
+                # Process batch (same as before, but now off receive thread)
+                self._on_batch_received(device_id, emg_samples, imu_samples)
+                
+            except queue.Empty:
+                continue  # No batch available, continue waiting
+            except Exception as e:
+                if self.debug:
+                    print(f"⚠️  Processing worker error: {e}")
+                import traceback
+                traceback.print_exc()
+    
     def _on_batch_received(self, device_id: int, emg_samples: np.ndarray, imu_samples: np.ndarray):
         """
         Callback when a batch is received from ESP32.
         Routes data to the appropriate device pipeline.
+        NOW RUNS IN WORKER THREAD (not UDP receive thread).
         
         Args:
             device_id: Device ID (1=LEFT, 2=RIGHT)
@@ -728,18 +781,25 @@ class InferenceEngine:
         current_time = time.time()
         time_since_last_data = current_time - self.last_data_received_time[device_id]
         
-        # Detect packet loss - skip prediction if data is stale
+        # CRITICAL: Detect packet loss EARLY - skip prediction if data is stale
+        # This prevents processing old buffered data after device turns off
         if time_since_last_data > self.data_timeout:
             if not self.packet_loss_detected[device_id]:
                 self.packet_loss_detected[device_id] = True
                 print(f"⚠️  [{pipeline.device_name}] Packet loss detected (no data for {time_since_last_data:.2f}s)")
                 # Clear buffers to prevent stale predictions
                 pipeline.window_buffer.clear()
+                # CRITICAL: Immediately set to REST for safety
+                pipeline.last_prediction = 'REST'
+                pipeline.last_confidence = 0.0
+                # Update wheelchair command immediately
+                self._update_wheelchair_command()
             return  # Don't process stale data
         
-        # Process windows (limit to prevent backlog)
+        # CRITICAL: Reduce windows per batch for faster response
+        # Lower limit = shorter processing time per callback = more responsive UDP reception
         windows_created = 0
-        max_windows_per_batch = 10
+        max_windows_per_batch = 3  # REDUCED from 10 to 3 for faster response
         
         while pipeline.window_buffer.can_create_window() and windows_created < max_windows_per_batch:
             # Check data freshness during processing
@@ -1337,12 +1397,24 @@ class InferenceEngine:
         print(f"   6. Run with --debug for detailed packet info")
         print("─"*70 + "\n")
         
+        # CRITICAL: Start processing worker thread before UDP servers
+        print("\n🚀 Starting processing worker thread...")
+        self.processing_running = True
+        self.processing_thread = threading.Thread(
+            target=self._processing_worker,
+            daemon=True,
+            name="Batch-Processing-Worker"
+        )
+        self.processing_thread.start()
+        print(f"   ✅ Processing worker ready (queue-based for low latency)")
+        
         # Start BOTH servers (dual-port mode)
         print("\n🚀 Starting DUAL-PORT UDP servers...")
         self.server_left.start()
         print(f"   ✅ LEFT server ready on port {self.port}")
         self.server_right.start()
         print(f"   ✅ RIGHT server ready on port {self.port + 1}")
+        print(f"   ✅ UDP reception now non-blocking (queue-based processing)")
         
         # Print initial waiting display
         print("\n")  # Add some space before static display
@@ -1365,10 +1437,32 @@ class InferenceEngine:
         last_waiting_update = 0
         waiting_update_interval = 1.0
         
+        # CRITICAL: Periodic timeout check for faster "device off" detection
+        last_timeout_check = 0
+        timeout_check_interval = 0.1  # Check every 100ms for responsive device-off detection
+        
         while True:
             time.sleep(0.01)  # 100Hz loop
             
             current_time = time.time()
+            
+            # CRITICAL: Periodic timeout check - detect device off within 100ms
+            # This ensures we don't wait for the next packet to notice device is off
+            if current_time - last_timeout_check >= timeout_check_interval:
+                for device_id, pipeline in self.pipelines.items():
+                    if self.last_data_received_time[device_id] is not None:
+                        time_since_last_data = current_time - self.last_data_received_time[device_id]
+                        if time_since_last_data > self.data_timeout:
+                            if not self.packet_loss_detected[device_id]:
+                                self.packet_loss_detected[device_id] = True
+                                print(f"⚠️  [{pipeline.device_name}] Device timeout (no data for {time_since_last_data:.2f}s)")
+                                # CRITICAL: Immediately set to REST
+                                pipeline.last_prediction = 'REST'
+                                pipeline.last_confidence = 0.0
+                                pipeline.window_buffer.clear()
+                                # Update wheelchair command immediately
+                                self._update_wheelchair_command()
+                last_timeout_check = current_time
             
             # Show waiting display if no predictions yet
             total_predictions = self.left_pipeline.total_sequences_processed + self.right_pipeline.total_sequences_processed
@@ -1377,12 +1471,14 @@ class InferenceEngine:
                     self._print_waiting_display()
                     last_waiting_update = current_time
             
-            # Check for packet loss per device
+            # Legacy check (now supplemented by periodic check above)
             for device_id, pipeline in self.pipelines.items():
                 if self.last_data_received_time[device_id] is not None:
                     time_since_last_data = current_time - self.last_data_received_time[device_id]
                     if time_since_last_data > self.data_timeout:
                         if not self.packet_loss_detected[device_id]:
+                            self.packet_loss_detected[device_id] = True
+                            print(f"⚠️  [{pipeline.device_name}] Packet loss detected (no data for {time_since_last_data:.2f}s)")
                             pipeline.window_buffer.clear()
                             self.packet_loss_detected[device_id] = True
                             # Emergency stop on packet loss
@@ -1434,6 +1530,13 @@ class InferenceEngine:
             self.wheelchair_controller.emergency_stop()
             self.wheelchair_controller.cleanup()
         
+        # CRITICAL: Stop processing worker thread
+        print("🛑 Stopping processing worker...")
+        self.processing_running = False
+        if self.processing_thread is not None:
+            self.processing_thread.join(timeout=2.0)
+        
+        # Stop UDP servers
         self.server_left.stop()
         self.server_right.stop()
         
