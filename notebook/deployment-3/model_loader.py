@@ -1,6 +1,11 @@
 """
 Model loader for deployment inference.
-Loads the trained LSTM model and configuration.
+Loads the trained multi-branch LSTM model and configuration.
+
+Architecture matches LSTM.ipynb exactly:
+- 9 branches: RawTime, RawFreq, RmsLms, WienerTD, WienerFFT, IMU,
+              SpectralRaw, SpectralWiener, WindowStats
+- 2-layer unidirectional LSTM, mean pooling, linear classifier
 """
 
 import json
@@ -13,60 +18,243 @@ import torch
 import torch.nn as nn
 
 
+# ---------------------------------------------------------------------------
+# Branch modules (match LSTM.ipynb exactly)
+# ---------------------------------------------------------------------------
+
+class UltraCompactBranch(nn.Module):
+    """3-conv + pool + projection branch for 1-channel time-domain signals."""
+
+    def __init__(self, in_channels: int = 1, d_model: int = 16):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, 16, kernel_size=5, stride=2, padding=2)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.conv3 = nn.Conv1d(32, 32, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm1d(32)
+        self.relu = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Linear(32, d_model)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, channels, length)  or  (batch, channels, length)
+        if x.dim() == 4:
+            batch_size, seq_len, channels, length = x.shape
+            x = x.view(batch_size * seq_len, channels, length)
+            reshape = True
+        else:
+            reshape = False
+            batch_size = x.shape[0]
+            seq_len = 1
+
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.pool(x).squeeze(-1)
+        x = self.dropout(self.proj(x))
+
+        if reshape:
+            x = x.view(batch_size, seq_len, -1)
+        return x
+
+
+class RawEMGTimeBranch(UltraCompactBranch):
+    def __init__(self, d_model: int = 16):
+        super().__init__(in_channels=1, d_model=d_model)
+
+
+class RawEMGFreqBranch(nn.Module):
+    """Raw EMG frequency-domain branch — computes FFT internally."""
+
+    def __init__(self, d_model: int = 16, fft_bins: int = 64):
+        super().__init__()
+        self.fft_bins = fft_bins
+        self.conv1 = nn.Conv1d(1, 8, kernel_size=5, stride=2, padding=2)
+        self.bn1 = nn.BatchNorm1d(8)
+        self.conv2 = nn.Conv1d(8, 16, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm1d(16)
+        self.relu = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Linear(16, d_model)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, 1, window_size)
+        if x.dim() == 4:
+            batch_size, seq_len, channels, length = x.shape
+            x = x.view(batch_size * seq_len, channels, length)
+            reshape = True
+        else:
+            reshape = False
+            batch_size = x.shape[0]
+            seq_len = 1
+            x = x.unsqueeze(0) if x.dim() == 2 else x
+
+        x_signal = x.squeeze(1)                           # (B, L)
+        x_fft_mag = torch.abs(torch.fft.rfft(x_signal, dim=1))  # (B, L//2+1)
+
+        if x_fft_mag.shape[1] != self.fft_bins:
+            x_fft_mag = torch.nn.functional.interpolate(
+                x_fft_mag.unsqueeze(1),
+                size=self.fft_bins,
+                mode='linear',
+                align_corners=False,
+            ).squeeze(1)
+
+        x_fft_mag = x_fft_mag.unsqueeze(1)               # (B, 1, fft_bins)
+        x = self.relu(self.bn1(self.conv1(x_fft_mag)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x).squeeze(-1)
+        x = self.dropout(self.proj(x))
+
+        if reshape:
+            x = x.view(batch_size, seq_len, -1)
+        return x
+
+
+class RMSLMSBranch(UltraCompactBranch):
+    """RMS envelope branch — single time-domain channel."""
+    def __init__(self, d_model: int = 16):
+        super().__init__(in_channels=1, d_model=d_model)
+
+
+class WienerTDBranch(UltraCompactBranch):
+    """Wiener-filtered time-domain branch."""
+    def __init__(self, d_model: int = 16):
+        super().__init__(in_channels=1, d_model=d_model)
+
+
+class WienerFFTBranch(nn.Module):
+    """Wiener pre-computed FFT bins branch."""
+
+    def __init__(self, d_model: int = 16, fft_bins: int = 64):
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, 8, kernel_size=5, stride=2, padding=2)
+        self.bn1 = nn.BatchNorm1d(8)
+        self.conv2 = nn.Conv1d(8, 16, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm1d(16)
+        self.relu = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.proj = nn.Linear(16, d_model)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, 64)  or  (batch, 64)
+        if x.dim() == 3:
+            batch_size, seq_len, features = x.shape
+            x = x.view(batch_size * seq_len, 1, features)
+            reshape = True
+        else:
+            reshape = False
+            batch_size = x.shape[0]
+            seq_len = 1
+            x = x.unsqueeze(1)
+
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x).squeeze(-1)
+        x = self.dropout(self.proj(x))
+
+        if reshape:
+            x = x.view(batch_size, seq_len, -1)
+        return x
+
+
+class IMUBranch(UltraCompactBranch):
+    """6-channel IMU branch."""
+    def __init__(self, d_model: int = 16):
+        super().__init__(in_channels=6, d_model=d_model)
+
+
+class SpectralFeatureEncoder(nn.Module):
+    """Lightweight MLP for 5-d spectral feature vectors."""
+
+    def __init__(self, input_dim: int = 5, d_model: int = 16, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, 5)
+        batch, seq_len, feat = x.shape
+        x = self.net(x.view(batch * seq_len, feat))
+        return x.view(batch, seq_len, -1)
+
+
+class WindowStatsEncoder(nn.Module):
+    """MLP for 16-d time-domain statistics (raw + wiener)."""
+
+    def __init__(self, input_dim: int = 16, d_model: int = 16, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, 16)
+        batch, seq_len, feat = x.shape
+        x = self.net(x.view(batch * seq_len, feat))
+        return x.view(batch, seq_len, -1)
+
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
+
 class EMGLSTMModel(nn.Module):
     """
-    Enhanced LSTM model for REST vs FIST classification with temporal attention.
+    Multi-branch LSTM model matching LSTM.ipynb exactly.
 
-    This matches the architecture defined in notebook/LSTM.ipynb, including:
-    - CNN envelope branch
-    - Minimal feature set per window (envelope + 3 bandpowers + 4 IMU stats)
-    - Optional temporal feature expansion (rate-of-change, variance, trend)
-    - Temporal attention over sequence timesteps
+    Input batch keys:
+        raw          (batch, seq_len, 1, window_size)
+        rms_lms      (batch, seq_len, 1, window_size)
+        wiener_td    (batch, seq_len, 1, window_size)
+        wiener_fft   (batch, seq_len, 64)
+        imu          (batch, seq_len, 6, n_imu_samples)
+        spectral_raw    (batch, seq_len, 5)
+        spectral_wiener (batch, seq_len, 5)
+        window_stats    (batch, seq_len, 16)
     """
 
     def __init__(
         self,
         num_classes: int = 2,
-        window_size: int = 100,
+        d_model: int = 16,
         hidden_size: int = 32,
         num_layers: int = 2,
-        dropout: float = 0.5,
-        sequence_length: int = 16,
+        dropout: float = 0.65,
+        sequence_length: int = 8,
         bidirectional: bool = False,
-        use_temporal_features: bool = True,
     ) -> None:
         super().__init__()
-
         self.sequence_length = sequence_length
-        self.window_size = window_size
-        self.use_temporal_features = use_temporal_features
+        self.d_model = d_model
 
-        # EMG envelope processor (simple CNN to extract amplitude patterns)
-        self.emg_envelope_processor = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(),
-            nn.Conv1d(8, 16, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(16, 8),
-        )
+        # Signal branches
+        self.raw_time_branch = RawEMGTimeBranch(d_model=d_model)
+        self.raw_freq_branch = RawEMGFreqBranch(d_model=d_model, fft_bins=64)
+        self.rms_lms_branch = RMSLMSBranch(d_model=d_model)
+        self.wiener_td_branch = WienerTDBranch(d_model=d_model)
+        self.wiener_fft_branch = WienerFFTBranch(d_model=d_model, fft_bins=64)
+        self.imu_branch = IMUBranch(d_model=d_model)
 
-        # Base feature dimension per window:
-        # - EMG envelope: 8 (from CNN)
-        # - EMG bandpowers: 3 (low/mid/high)
-        # - IMU: 4 (gyro_mag_mean, accel_mag_mean, gyro_mag_std, accel_mag_std)
-        # - vs-REST features: 2 (envelope_vs_rest, high_bandpower_vs_rest)
-        base_feature_dim = 8 + 3 + 4 + 2  # = 17 features per window
+        # Scalar feature encoders
+        self.spectral_raw_encoder = SpectralFeatureEncoder(input_dim=5, d_model=d_model)
+        self.spectral_wiener_encoder = SpectralFeatureEncoder(input_dim=5, d_model=d_model)
+        self.window_stats_encoder = WindowStatsEncoder(input_dim=16, d_model=d_model)
 
-        # With temporal features: 17 * 4 = 68 features per window
-        # (original + rate_of_change + variance + trend)
-        if use_temporal_features:
-            feature_dim = base_feature_dim * 4
-        else:
-            feature_dim = base_feature_dim
-
-        # LSTM processes sequence
+        # LSTM (9 branches × d_model)
+        feature_dim = 9 * d_model
         self.lstm = nn.LSTM(
             input_size=feature_dim,
             hidden_size=hidden_size,
@@ -76,209 +264,104 @@ class EMGLSTMModel(nn.Module):
             batch_first=True,
         )
 
-        # LSTM output dimension
-        lstm_output_dim = hidden_size * 2 if bidirectional else hidden_size
-
-        # Temporal attention mechanism
-        self.temporal_attention = nn.Sequential(
-            nn.Linear(lstm_output_dim, lstm_output_dim // 2),
-            nn.Tanh(),
-            nn.Linear(lstm_output_dim // 2, 1),
-        )
+        lstm_out_dim = hidden_size * 2 if bidirectional else hidden_size
 
         # Classification head
         self.dropout_cls = nn.Dropout(dropout)
-        self.classifier = nn.Linear(lstm_output_dim, num_classes)
-
-    def _add_temporal_features(self, combined_features: torch.Tensor) -> torch.Tensor:
-        """
-        Add temporal features to base per-window features:
-        - Rate of change (derivative)
-        - Temporal variance (consistency across sequence)
-        - Trend (linear trend over timesteps)
-
-        Args:
-            combined_features: (batch, seq_len, feature_dim) - base features
-
-        Returns:
-            enhanced_features: (batch, seq_len, feature_dim * 4)
-        """
-        batch_size, seq_len, feature_dim = combined_features.shape
-
-        # Rate of change between consecutive windows
-        if seq_len > 1:
-            rate_of_change = combined_features[:, 1:, :] - combined_features[:, :-1, :]
-            rate_of_change = torch.cat(
-                [torch.zeros_like(combined_features[:, :1, :]), rate_of_change],
-                dim=1,
-            )
-        else:
-            rate_of_change = torch.zeros_like(combined_features)
-
-        # Temporal variance across sequence (same for all timesteps in a sequence)
-        temporal_var = torch.std(combined_features, dim=1, keepdim=True)
-        temporal_var = temporal_var.expand(-1, seq_len, -1)
-
-        # Linear trend across sequence (slope per feature)
-        if seq_len > 2:
-            indices = torch.arange(
-                seq_len, dtype=combined_features.dtype, device=combined_features.device
-            )
-            indices = indices.unsqueeze(0).unsqueeze(-1)  # (1, seq_len, 1)
-            mean_idx = (seq_len - 1) / 2.0
-            indices_centered = indices - mean_idx
-
-            mean_feat = torch.mean(combined_features, dim=1, keepdim=True)
-            numerator = torch.sum(
-                indices_centered * (combined_features - mean_feat),
-                dim=1,
-                keepdim=True,
-            )
-            denominator = torch.sum(indices_centered**2, dim=1, keepdim=True) + 1e-10
-            trend = numerator / denominator  # (batch, 1, features)
-            trend = trend.expand(-1, seq_len, -1)
-        else:
-            trend = torch.zeros_like(combined_features)
-
-        # Concatenate temporal features
-        enhanced_features = torch.cat(
-            [combined_features, rate_of_change, temporal_var, trend],
-            dim=2,
-        )
-
-        return enhanced_features
+        self.classifier = nn.Linear(lstm_out_dim, num_classes)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass.
+        raw = batch["raw"]
+        rms_lms = batch["rms_lms"]
+        wiener_td = batch["wiener_td"]
+        wiener_fft = batch["wiener_fft"]
+        imu = batch["imu"]
+        spectral_raw = batch["spectral_raw"]
+        spectral_wiener = batch["spectral_wiener"]
+        window_stats = batch["window_stats"]
 
-        Args:
-            batch: Dictionary with:
-                - 'emg_envelope': (batch, seq_len, window_size)
-                - 'emg_bandpowers': (batch, seq_len, 3)
-                - 'imu_features': (batch, seq_len, 4)
-                - 'vs_rest': (batch, seq_len, 2) - [envelope_vs_rest, high_bandpower_vs_rest]
-
-        Returns:
-            logits: (batch, num_classes)
-        """
-        emg_envelope = batch["emg_envelope"]
-        emg_bandpowers = batch["emg_bandpowers"]
-        imu_features = batch["imu_features"]
-        vs_rest = batch.get("vs_rest", torch.zeros(emg_envelope.shape[0], emg_envelope.shape[1], 2, device=emg_envelope.device))
-
-        batch_size, seq_len = emg_envelope.shape[:2]
-
-        # Process EMG envelope through CNN
-        envelope_flat = emg_envelope.view(batch_size * seq_len, 1, self.window_size)
-        envelope_features = self.emg_envelope_processor(envelope_flat)
-        envelope_features = envelope_features.view(batch_size, seq_len, -1)
-
-        # Concatenate base features (including vs-REST features)
-        combined_features = torch.cat(
-            [envelope_features, emg_bandpowers, imu_features, vs_rest],
+        combined = torch.cat(
+            [
+                self.raw_time_branch(raw),
+                self.raw_freq_branch(raw),
+                self.rms_lms_branch(rms_lms),
+                self.wiener_td_branch(wiener_td),
+                self.wiener_fft_branch(wiener_fft),
+                self.imu_branch(imu),
+                self.spectral_raw_encoder(spectral_raw),
+                self.spectral_wiener_encoder(spectral_wiener),
+                self.window_stats_encoder(window_stats),
+            ],
             dim=2,
-        )  # (batch, seq_len, 17)
+        )  # (batch, seq_len, 9*d_model)
 
-        # Add temporal features if enabled
-        if self.use_temporal_features:
-            combined_features = self._add_temporal_features(combined_features)
-
-        # LSTM processing
-        lstm_out, _ = self.lstm(combined_features)  # (batch, seq_len, hidden)
-
-        # Temporal attention pooling over timesteps
-        attention_scores = self.temporal_attention(lstm_out)  # (batch, seq_len, 1)
-        attention_weights = torch.softmax(attention_scores, dim=1)
-        pooled = torch.sum(attention_weights * lstm_out, dim=1)  # (batch, hidden)
-
-        # Classification
-        pooled = self.dropout_cls(pooled)
-        logits = self.classifier(pooled)
-
+        lstm_out, _ = self.lstm(combined)
+        pooled = lstm_out.mean(dim=1)               # mean pooling over time
+        logits = self.classifier(self.dropout_cls(pooled))
         return logits
 
 
-def load_model(model_dir: str, device: str = "cpu") -> Tuple[EMGLSTMModel, Dict[str, Any], Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
+
+def load_model(
+    model_dir: str, device: str = "cpu"
+) -> Tuple[EMGLSTMModel, Dict[str, Any], Dict[str, Any]]:
     """
-    Load the trained model, configuration, and scalers.
-    
-    Args:
-        model_dir: Directory containing deployment files
-        device: Device to load model on ('cpu' or 'cuda')
-    
+    Load the trained model, deployment configuration, and StandardScalers.
+
     Returns:
-        model: Loaded PyTorch model
-        config: Deployment configuration dictionary
-        scalers: Dictionary of StandardScaler objects
+        model   – loaded EMGLSTMModel in eval mode
+        config  – deployment_config.json contents (+ class_names key)
+        scalers – dict of StandardScaler objects keyed by feature name
     """
     model_dir = Path(model_dir)
-    
-    # Load configuration
-    config_path = model_dir / 'deployment_config.json'
+
+    config_path = model_dir / "deployment_config.json"
     if not config_path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
+        raise FileNotFoundError(f"Config not found: {config_path}")
+    with open(config_path) as f:
         config = json.load(f)
-    
-    # Load scalers
-    scaler_path = model_dir / 'standard_scalers.pkl'
+
+    scaler_path = model_dir / "standard_scalers.pkl"
     if not scaler_path.exists():
-        raise FileNotFoundError(f"Scaler file not found: {scaler_path}")
-    
-    with open(scaler_path, 'rb') as f:
+        raise FileNotFoundError(f"Scalers not found: {scaler_path}")
+    with open(scaler_path, "rb") as f:
         scalers = pickle.load(f)
-    
-    # Load model
-    model_path = model_dir / 'emg_lstm_model.pt'
+
+    model_path = model_dir / "emg_lstm_model.pt"
     if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-    
-    # PyTorch 2.6+ defaults to weights_only=True for security, but our checkpoint
-    # contains sklearn LabelEncoder objects. Since this is our own trusted model file,
-    # we safely disable weights_only restriction.
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    
-    # Extract model config - filter to only include valid parameters
-    raw_model_config = checkpoint.get('model_config', {})
-    
-    # Define valid parameters for EMGLSTMModel
-    valid_params = {
-        "num_classes": raw_model_config.get("num_classes", 2),
-        "window_size": raw_model_config.get("window_size", config.get("window_size", 100)),
-        "hidden_size": raw_model_config.get("hidden_size", 32),
-        "num_layers": raw_model_config.get("num_layers", 2),
-        "dropout": raw_model_config.get("dropout", 0.5),
-        "sequence_length": raw_model_config.get("sequence_length", config.get("sequence_length", 16)),
-        "bidirectional": raw_model_config.get("bidirectional", False),
-        "use_temporal_features": raw_model_config.get("use_temporal_features", True),
+
+    raw_cfg = checkpoint.get("model_config", {})
+    model_params = {
+        "num_classes":    raw_cfg.get("num_classes",    2),
+        "d_model":        raw_cfg.get("d_model",        16),
+        "hidden_size":    raw_cfg.get("hidden_size",    32),
+        "num_layers":     raw_cfg.get("num_layers",     2),
+        "dropout":        raw_cfg.get("dropout",        0.65),
+        "sequence_length": raw_cfg.get("sequence_length", config.get("sequence_length", 8)),
+        "bidirectional":  raw_cfg.get("bidirectional",  False),
     }
-    
-    # Create model instance with only valid parameters
-    model = EMGLSTMModel(**valid_params)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    model = EMGLSTMModel(**model_params)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    
-    # Extract class names - handle both string and numeric formats
-    class_names_raw = checkpoint.get('class_names', None)
-    if class_names_raw is None:
-        class_names = ['REST', 'FIST']
-    elif isinstance(class_names_raw, list):
-        # Check if it's numeric [0, 1] or string ['REST', 'FIST']
-        if len(class_names_raw) == 2 and all(isinstance(x, (int, float)) for x in class_names_raw):
-            # Convert numeric to string labels (assume 0=REST, 1=FIST)
-            class_names = ['REST', 'FIST']
-        elif all(isinstance(x, str) for x in class_names_raw):
-            class_names = class_names_raw
-        else:
-            class_names = ['REST', 'FIST']
-    else:
-        class_names = ['REST', 'FIST']
-    
-    config['class_names'] = class_names
-    config['model_config'] = valid_params  # Store filtered config
-    
-    return model, config, scalers
 
+    # Normalise class names
+    raw_names = checkpoint.get("class_names", None)
+    if raw_names is None:
+        class_names = ["REST", "FIST"]
+    elif isinstance(raw_names, list) and all(isinstance(n, str) for n in raw_names):
+        class_names = raw_names
+    else:
+        class_names = ["REST", "FIST"]
+
+    config["class_names"] = class_names
+    config["model_config"] = model_params
+
+    return model, config, scalers

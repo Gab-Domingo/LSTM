@@ -392,12 +392,7 @@ class DevicePipeline:
         self.prediction_history = deque(maxlen=5)  # Last 5 predictions for safety
         self.last_fist_time = None  # Track when FIST was last detected
         
-        # Feature smoothing for better model input quality
-        # Smooth features temporally to reduce noise and help model see clearer signals
-        self.feature_history = {
-            'envelope_mean': deque(maxlen=5),  # Last 5 envelope means
-            'high_bandpower': deque(maxlen=5),  # Last 5 high bandpowers
-        }
+        # (vs-rest feature history removed — new model does not use vs-rest inputs)
         
         # REMOVED: REST confirmation logic - we now trust the model's predictions directly
         
@@ -841,8 +836,8 @@ class InferenceEngine:
                     continue
             
             # SIGNAL VALIDITY GATING: Check if signal is valid before processing
-            envelope = features['emg_envelope']
-            bandpowers = features['emg_bandpowers']
+            envelope = features['_emg_envelope']
+            bandpowers = features['_emg_bandpowers']
             signal_state = pipeline.update_signal_state(emg_window, envelope, bandpowers)
             
             # Check if window should be processed (gated classification)
@@ -872,7 +867,7 @@ class InferenceEngine:
                 pipeline.filter_warmup_windows += 1
                 
                 # Track envelope stability
-                env_mean = np.mean(features['emg_envelope'])
+                env_mean = np.mean(features['_emg_envelope'])
                 pipeline.warmup_envelope_history.append(env_mean)
                 
                 # Check readiness
@@ -909,7 +904,7 @@ class InferenceEngine:
                     pipeline.rest_baseline_start_time = time.time()
                     pipeline.baseline_envelope_history = deque(maxlen=25)
                 
-                env_mean = np.mean(features['emg_envelope'])
+                env_mean = np.mean(features['_emg_envelope'])
                 pipeline.baseline_envelope_history.append(env_mean)
                 
                 # Collect baseline samples
@@ -942,15 +937,9 @@ class InferenceEngine:
                     windows_created += 1
                     continue
             
-            # Compute vs-REST features
-            vs_rest_features = self._compute_vs_rest_features(features, pipeline)
-            
-            # Normalize features
+            # Normalize features (STEP 2: global StandardScaler)
             normalized_features = pipeline.preprocessor.normalize_features(features)
-            
-            # Add vs-REST features
-            normalized_features['vs_rest'] = vs_rest_features
-            
+
             # Update sequence buffer
             sequence_ready = pipeline.window_buffer.update_sequence(normalized_features)
             
@@ -969,55 +958,46 @@ class InferenceEngine:
     
     def _run_inference(self, pipeline: DevicePipeline):
         """
-        Run model inference on current sequence for a specific device.
-        Trusts the raw model prediction - the model was trained on filtered features
-        (amplitude, bandpower, vs_rest) and should confidently distinguish REST from FIST.
-        
+        Run model inference on the current sequence for a specific device.
+        Builds the batch in the format expected by the multi-branch EMGLSTMModel.
+
         Args:
             pipeline: DevicePipeline instance to run inference on
         """
-        # Get sequence
         sequence = pipeline.window_buffer.get_sequence()
         if sequence is None:
             return
-        
-        # EXPLICIT MOTION ARTIFACT REJECTION: Reject FIST if motion detected
-        # IMU features: [gyro_mag_mean, accel_mag_mean, gyro_mag_std, accel_mag_std]
-        imu_features = sequence['imu_features']  # (seq_len, 4)
-        avg_gyro_mag = np.mean(imu_features[:, 0])  # Average gyro magnitude across sequence
-        avg_accel_mag = np.mean(imu_features[:, 1])  # Average accelerometer magnitude
-        gyro_std = np.mean(imu_features[:, 2])  # Average gyro std (indicates variability)
-        
-        # Motion artifact thresholds (tuned for wheelchair control)
-        # Typical REST: gyro_mag < 200, hand waving: gyro_mag > 500
-        # Motion artifacts: high gyro + high accel = arm movement (not muscle contraction)
-        motion_gyro_threshold = 400.0  # High gyro = arm movement
-        motion_accel_threshold = 1500.0  # High accel = arm movement
-        motion_detected = (avg_gyro_mag > motion_gyro_threshold) or (avg_accel_mag > motion_accel_threshold)
-        
-        # Prepare batch for model inference
+
+        # ── Build batch (shapes match EMGLSTMModel.forward docstring) ────
+        # raw / rms_lms / wiener_td: (seq_len, window_size) → (1, seq_len, 1, window_size)
+        def _td(key):
+            return torch.FloatTensor(sequence[key]).unsqueeze(0).unsqueeze(2).to(self.device)
+
+        # wiener_fft / spectral_raw / spectral_wiener / window_stats:
+        # (seq_len, n_feat) → (1, seq_len, n_feat)
+        def _vec(key):
+            return torch.FloatTensor(sequence[key]).unsqueeze(0).to(self.device)
+
+        # imu: (seq_len, 6, n_imu) → (1, seq_len, 6, n_imu)
         batch = {
-            'emg_envelope': torch.FloatTensor(sequence['emg_envelope']).unsqueeze(0).to(self.device),
-            'emg_bandpowers': torch.FloatTensor(sequence['emg_bandpowers']).unsqueeze(0).to(self.device),
-            'imu_features': torch.FloatTensor(sequence['imu_features']).unsqueeze(0).to(self.device),
-            'vs_rest': torch.FloatTensor(sequence.get('vs_rest', np.zeros((self.sequence_length, 2)))).unsqueeze(0).to(self.device)
+            'raw':             _td('raw'),
+            'rms_lms':         _td('rms_lms'),
+            'wiener_td':       _td('wiener_td'),
+            'wiener_fft':      _vec('wiener_fft'),
+            'imu':             _vec('imu'),
+            'spectral_raw':    _vec('spectral_raw'),
+            'spectral_wiener': _vec('spectral_wiener'),
+            'window_stats':    _vec('window_stats'),
         }
-        
-        # Run model inference
+
+        # ── Forward pass ─────────────────────────────────────────────────
         with torch.no_grad():
             logits = self.model(batch)
             probs = torch.softmax(logits, dim=1)
             pred_idx = torch.argmax(probs, dim=1).item()
             confidence = probs[0, pred_idx].item()
-        
-        # Get raw prediction from model
-        raw_pred_class = self.class_names[pred_idx]
-        
-        # SIMPLIFIED: Trust the model prediction directly (no motion artifact rejection since gyro is disabled)
-        # REMOVED: Motion artifact rejection logic (gyro is now disabled in LMS)
-        # REMOVED: Feature-based smoothing and sustained FIST tracker
-        # The model was trained to handle these cases, so we trust its predictions
-        final_prediction = raw_pred_class
+
+        final_prediction = self.class_names[pred_idx]
         
         # Track prediction history for safety monitoring
         pipeline.prediction_history.append(final_prediction)
@@ -1063,59 +1043,60 @@ class InferenceEngine:
 
     def _update_wheelchair_command(self):
         """
-        Combine predictions from LEFT and RIGHT devices with MODEL-DRIVEN control.
-        Uses SMOOTHED predictions (majority vote) to eliminate flicker.
-        
-        OPTIMIZED Control Logic (per deployment_config.json):
-        1. Trust model's argmax prediction (optimal_threshold: 0.5)
-        2. Use temporal smoothing (3-frame majority vote) to eliminate flicker
-        3. No artificial confidence gating - model is well-trained (86% accuracy, 82% mean confidence)
-        4. Commands execute immediately based on smoothed predictions
-        
+        Combine LEFT and RIGHT device predictions into a wheelchair command.
+
+        Control logic:
+        - Primary: use 3-frame majority-vote smoothed prediction per arm.
+        - Confidence gate: treat < 0.40 confidence as REST (signal quality guard).
+        - FORWARD coincidence window: FORWARD also triggers when both arms have
+          had FIST in ≥ 3 of their last 5 raw predictions AND at least one arm
+          is currently FIST.  This handles the case where one arm briefly dips
+          to REST mid-contraction but the user is clearly doing both fists.
+          No per-arm prediction is overridden — we use the model's own history.
+
         Motor Control:
-        - Device 1 (LEFT) FIST → RIGHT motor spins → LEFT turn
-        - Device 2 (RIGHT) FIST → LEFT motor spins → RIGHT turn  
-        - BOTH devices FIST → BOTH motors spin → FORWARD
-        - REST (either device) → Stop motors immediately
+        - LEFT  FIST only  → LEFT turn
+        - RIGHT FIST only  → RIGHT turn
+        - BOTH  FIST       → FORWARD
+        - REST             → STOP
         """
         current_time = time.time()
-        
-        # Get SMOOTHED predictions (majority vote over last 3 frames)
-        # This eliminates single-frame flicker while trusting the model
+
         left_pred = self.left_pipeline.smoothed_prediction
         right_pred = self.right_pipeline.smoothed_prediction
-        left_conf = self.left_pipeline.last_confidence
+        left_conf  = self.left_pipeline.last_confidence
         right_conf = self.right_pipeline.last_confidence
-        
-        # OPTIONAL: Light confidence filtering for very low confidence only
-        # Use deployment config's optimal_threshold (0.5) as a sanity check
-        # Only override on VERY low confidence (< 0.4) which indicates signal issues
-        min_confidence = 0.40  # Use config's recommendation; only filter extreme low confidence
-        
-        # Only override predictions if confidence is suspiciously low (likely signal issue)
-        if left_conf < min_confidence:
-            left_pred = 'REST'  # Safety override for poor signal quality
-        if right_conf < min_confidence:
-            right_pred = 'REST'  # Safety override for poor signal quality
-        
-        # Determine wheelchair command based on smoothed predictions
-        wheelchair_cmd = 'REST'
-        
-        # FORWARD: Both devices predict FIST
+
+        # Confidence gate — only suppress when confidence is extremely low
+        if left_conf < self.min_confidence:
+            left_pred = 'REST'
+        if right_conf < self.min_confidence:
+            right_pred = 'REST'
+
+        # ── Primary command decision ──────────────────────────────────────
         if left_pred == 'FIST' and right_pred == 'FIST':
             wheelchair_cmd = 'FORWARD'
-        
-        # LEFT turn: Only LEFT device predicts FIST
-        elif left_pred == 'FIST' and right_pred == 'REST':
+        elif left_pred == 'FIST':
             wheelchair_cmd = 'LEFT'
-        
-        # RIGHT turn: Only RIGHT device predicts FIST
-        elif left_pred == 'REST' and right_pred == 'FIST':
+        elif right_pred == 'FIST':
             wheelchair_cmd = 'RIGHT'
-        
-        # REST: Either both REST or confidence too low
         else:
             wheelchair_cmd = 'REST'
+
+        # ── FORWARD coincidence window ────────────────────────────────────
+        # FORWARD requires both arms simultaneously — but with independent
+        # 33 Hz pipelines a single dropped frame can prevent coincidence.
+        # If both arms were predominantly FIST in their recent raw history
+        # AND at least one is currently FIST, promote to FORWARD.
+        if wheelchair_cmd != 'FORWARD':
+            recent_left  = list(self.left_pipeline.prediction_history)
+            recent_right = list(self.right_pipeline.prediction_history)
+            left_fist_count  = sum(1 for p in recent_left  if p == 'FIST')
+            right_fist_count = sum(1 for p in recent_right if p == 'FIST')
+            # Threshold: ≥ 3 of the last 5 raw predictions = FIST for both arms
+            if (left_fist_count >= 3 and right_fist_count >= 3
+                    and (left_pred == 'FIST' or right_pred == 'FIST')):
+                wheelchair_cmd = 'FORWARD'
         
         # Update state
         self.last_wheelchair_command = wheelchair_cmd
@@ -1135,97 +1116,6 @@ class InferenceEngine:
         # Update unified display (includes command)
         self._print_unified_display()
     
-    def _compute_vs_rest_features(self, raw_features: dict, pipeline: DevicePipeline) -> np.ndarray:
-        """
-        Compute enhanced vs-REST features using ADAPTIVE baseline.
-        Uses original REST baseline as reference but adapts to current resting state (handles fatigue).
-        This allows REST detection even when muscle activity doesn't return to original baseline.
-        
-        Args:
-            raw_features: Raw feature dictionary (before normalization)
-            pipeline: DevicePipeline instance
-            
-        Returns:
-            vs_rest array (2,) - [envelope_vs_rest, high_bandpower_vs_rest]
-        """
-        # If REST baseline is available, compute vs-REST features
-        if (self.enable_rest_baseline and 
-            pipeline.preprocessor.rest_baseline_collected and 
-            pipeline.preprocessor.rest_baseline is not None):
-            
-            # SIMPLIFIED: Use original baseline only (no adaptive baseline)
-            rest_baseline = pipeline.preprocessor.rest_baseline
-            
-            # Compute envelope mean from current window (raw features)
-            envelope_mean = float(np.mean(raw_features['emg_envelope']))
-            high_bandpower = float(raw_features['emg_bandpowers'][2])
-            
-            # Add to feature history for temporal smoothing
-            pipeline.feature_history['envelope_mean'].append(envelope_mean)
-            pipeline.feature_history['high_bandpower'].append(high_bandpower)
-            
-            # Use smoothed features (temporal average) to reduce noise
-            # This helps the model see clearer REST vs FIST differences
-            if len(pipeline.feature_history['envelope_mean']) >= 3:
-                # Use median for robustness to outliers
-                smoothed_envelope = float(np.median(list(pipeline.feature_history['envelope_mean'])))
-                smoothed_bandpower = float(np.median(list(pipeline.feature_history['high_bandpower'])))
-            else:
-                # Not enough history yet - use current values
-                smoothed_envelope = envelope_mean
-                smoothed_bandpower = high_bandpower
-            
-            # Enhanced vs-REST computation with better discriminative power
-            if (rest_baseline['emg_envelope']['mean'] is not None and 
-                rest_baseline['emg_envelope']['std'] is not None):
-                rest_env_mean = rest_baseline['emg_envelope']['mean']
-                rest_env_std = rest_baseline['emg_envelope']['std']
-                
-                # Protect against division by zero
-                if rest_env_std < 1e-6:
-                    rest_env_std = 1.0
-                
-                # Enhanced z-score: Use smoothed envelope and add ratio component
-                # This makes REST vs FIST differences more pronounced
-                z_score = (smoothed_envelope - rest_env_mean) / rest_env_std
-                ratio = smoothed_envelope / (rest_env_mean + 1e-6)
-                
-                # Combine z-score and ratio for better discrimination
-                # When ratio is close to 1.0 (REST), z-score dominates
-                # When ratio is > 1.5 (FIST), ratio amplifies the signal
-                if ratio > 1.2:  # Clear elevation above REST
-                    env_vs_rest = z_score * (1.0 + 0.3 * (ratio - 1.0))  # Amplify FIST signal
-                else:
-                    env_vs_rest = z_score  # Use z-score for REST detection
-            else:
-                env_vs_rest = 0.0
-            
-            if (rest_baseline['emg_bandpowers']['mean'] is not None and 
-                len(rest_baseline['emg_bandpowers']['mean']) > 2 and
-                rest_baseline['emg_bandpowers']['std'] is not None and
-                len(rest_baseline['emg_bandpowers']['std']) > 2):
-                rest_bp_mean = rest_baseline['emg_bandpowers']['mean'][2]
-                rest_bp_std = rest_baseline['emg_bandpowers']['std'][2]
-                
-                # Protect against division by zero
-                if rest_bp_std < 1e-6:
-                    rest_bp_std = 1.0
-                
-                # Enhanced bandpower vs-REST with ratio amplification
-                z_score = (smoothed_bandpower - rest_bp_mean) / rest_bp_std
-                ratio = smoothed_bandpower / (rest_bp_mean + 1e-6)
-                
-                # Amplify FIST frequency content
-                if ratio > 1.2:
-                    high_vs_rest = z_score * (1.0 + 0.3 * (ratio - 1.0))
-                else:
-                    high_vs_rest = z_score
-            else:
-                high_vs_rest = 0.0
-            
-            return np.array([env_vs_rest, high_vs_rest], dtype=np.float32)
-        else:
-            return np.array([0.0, 0.0], dtype=np.float32)
     
     def _print_unified_display(self):
         """
