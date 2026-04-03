@@ -1,0 +1,34 @@
+{
+  "optimal_threshold": 0.7800000000000004,
+  "window_size": 100,
+  "stride": 25,
+  "sequence_length": 8,
+  "sampling_rate": 500,
+  "imu_sampling_rate": 100,
+  "normalization_method": "two-step",
+  "scaler_file": "standard_scalers.pkl",
+  "model_parameters": 55890,
+  "performance_metrics": {
+    "test_accuracy": 0.923469387755102,
+    "test_f1": 0.9229343531079935,
+    "test_precision": 0.9248634980307913,
+    "test_recall": 0.923469387755102,
+    "rest_recall": 0.8674698795180723,
+    "rest_precision": 0.9473684210526315,
+    "fist_recall": 0.9646017699115044,
+    "fist_precision": 0.9083333333333333
+  },
+  "confidence_metrics": {
+    "validation_confidence_mean": 0.828206479549408,
+    "validation_confidence_median": 0.8731722831726074,
+    "validation_low_confidence_pct": 9.91150442477876,
+    "test_confidence_mean": 0.8080139756202698,
+    "test_confidence_median": 0.907583475112915,
+    "test_low_confidence_pct": 21.428571428571427,
+    "confidence_warning": "GOOD"
+  },
+  "deployment_date": "2026-03-09 20:07:44.935338",
+  "test_user": "B",
+  "notes": "Model trained with per-user normalization, safety-first threshold selection",
+  "threshold_warning": "High threshold (0.78) indicates low model confidence"
+}
