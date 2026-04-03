@@ -1,0 +1,16 @@
+{
+  "model_file": "deployment\\emg_lstm_model.pt",
+  "config_file": "deployment\\deployment_config.json",
+  "model_size_mb": 0.21320343017578125,
+  "threshold": 0.7800000000000004,
+  "performance": {
+    "test_accuracy": 0.923469387755102,
+    "test_f1": 0.9229343531079935,
+    "test_precision": 0.9248634980307913,
+    "test_recall": 0.923469387755102,
+    "rest_recall": 0.8674698795180723,
+    "rest_precision": 0.9473684210526315,
+    "fist_recall": 0.9646017699115044,
+    "fist_precision": 0.9083333333333333
+  }
+}
