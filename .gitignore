@@ -19,6 +19,7 @@ env/
 venv/
 ENV/
 .venv
+feature_analysis_env/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -55,3 +56,6 @@ memory.yaml
 # Logs
 *.log
 logs/
+
+# Feature analysis results (generated files)
+feature_analysis_results/
